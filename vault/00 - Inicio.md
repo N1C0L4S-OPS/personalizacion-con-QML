@@ -28,6 +28,7 @@ Objetivo: entorno hacker elegante, minimalista y sofisticado para Hack The Box, 
   - [[Historial del portapapeles]]
   - [[Centro de control]]
   - [[GitHub por SSH]]
+  - [[Repositorio y migracion a Arch]]
 - **Terminal / HTB**
   - [[Helpers de HTB]]
   - [[Terminal - estilo]]
