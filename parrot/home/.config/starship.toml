@@ -1,0 +1,106 @@
+# Starship - prompt minimalista para Parrot + HTB
+# Los colores son los ANSI de kitty, que themegen genera desde el fondo:
+#   cyan = acento · bright-cyan = acento 2 · bright-black = texto tenue · red/green/yellow = estados
+"$schema" = 'https://starship.rs/config-schema.json'
+
+add_newline = true
+command_timeout = 800
+
+format = """
+[╭─](bright-black)[  ](bold cyan)$username$hostname$directory$git_branch$git_state$git_status$python\
+${env_var.TARGET_NAME}${env_var.TARGET_IP}$jobs$sudo$cmd_duration$status
+[╰─](bright-black)$character"""
+
+# usuario@host solo cuando importa (root o sesion SSH)
+[username]
+show_always = false
+style_user = "bold yellow"
+style_root = "bold red"
+format = "[$user]($style)"
+
+[hostname]
+ssh_only = true
+style = "bold yellow"
+format = "[@$hostname]($style) "
+
+[directory]
+truncation_length = 3
+truncate_to_repo = true
+truncation_symbol = "…/"
+home_symbol = "~"
+style = "bold cyan"
+read_only = " 󰌾"
+read_only_style = "red"
+format = "[ 󰉋 $path]($style)[$read_only]($read_only_style) "
+
+[git_branch]
+symbol = "󰘬 "
+style = "bright-cyan"
+format = "[$symbol$branch]($style) "
+
+[git_state]
+style = "yellow"
+format = "[$state( $progress_current/$progress_total)]($style) "
+
+[git_status]
+style = "bright-black"
+conflicted = "[=](red)"
+ahead = "[⇡$count](green)"
+behind = "[⇣$count](yellow)"
+diverged = "[⇕](yellow)"
+untracked = "?"
+modified = "[!](yellow)"
+staged = "[+](green)"
+deleted = "[✘](red)"
+stashed = "≡"
+format = "([$all_status$ahead_behind]($style) )"
+
+[python]
+symbol = " "
+style = "yellow"
+detect_extensions = []
+detect_files = []
+format = "[$symbol$virtualenv]($style) "
+
+# Objetivo de HTB (settarget <ip> <nombre>)
+[env_var.TARGET_NAME]
+variable = "TARGET_NAME"
+style = "bold red"
+format = "[ 󰓾 $env_value]($style)"
+
+[env_var.TARGET_IP]
+variable = "TARGET_IP"
+style = "red"
+format = "[ $env_value]($style) "
+
+[jobs]
+symbol = "󰜎 "
+style = "bright-black"
+format = "[$symbol$number]($style) "
+
+[cmd_duration]
+min_time = 2000
+style = "yellow"
+format = "[󱎫 $duration]($style) "
+
+# sudo con la contrasena en cache (cuidado al pegar comandos)
+[sudo]
+disabled = false
+symbol = "󰌋 "
+style = "bold yellow"
+format = "[$symbol]($style)"
+
+# Codigo de salida cuando el ultimo comando falla (127 = comando no encontrado)
+[status]
+disabled = false
+symbol = "✘ "
+not_found_symbol = "? "
+not_executable_symbol = "󰌾 "
+sigint_symbol = ""
+style = "red"
+format = "[$symbol$status]($style) "
+
+[character]
+success_symbol = "[❯](bold cyan)"
+error_symbol = "[❯](bold red)"
+vimcmd_symbol = "[❮](bold bright-cyan)"

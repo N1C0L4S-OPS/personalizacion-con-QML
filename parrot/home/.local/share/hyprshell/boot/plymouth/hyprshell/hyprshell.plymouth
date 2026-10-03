@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=hyprshell
+Description=Carga minimalista: loro de Parrot con brillo y linea de progreso (paleta del fondo)
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/hyprshell
+ScriptFile=/usr/share/plymouth/themes/hyprshell/hyprshell.script

@@ -1,0 +1,2 @@
+// hyprshell: tras cada instalacion/actualizacion, comprueba que Plymouth siga con el tema propio
+DPkg::Post-Invoke { "/usr/local/sbin/hyprshell-plymouth-guard || true"; };

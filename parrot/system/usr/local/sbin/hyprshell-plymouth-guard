@@ -1,0 +1,7 @@
+#!/bin/bash
+# hyprshell: si una actualizacion devolvio Plymouth a otro tema (p. ej. parrot6), lo restaura
+# y regenera el arranque inicial de todos los kernels. Si el tema ya es hyprshell, no hace nada.
+[ -d /usr/share/plymouth/themes/hyprshell ] || exit 0
+[ "$(plymouth-set-default-theme 2>/dev/null)" = hyprshell ] && exit 0
+echo "hyprshell: restaurando el tema de Plymouth y regenerando initramfs"
+plymouth-set-default-theme hyprshell && update-initramfs -u -k all

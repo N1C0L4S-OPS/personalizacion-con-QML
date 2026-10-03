@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""hyprshell-pkg - motor del instalador de paquetes de la shell (Super+I).
+
+  hyprshell-pkg sources                 fuentes disponibles en este sistema (JSON)
+  hyprshell-pkg list apt|flatpak        catalogo: nombre \t descripcion corta \t instalado(0/1) [\t version \t id]
+  hyprshell-pkg info apt|flatpak ID     detalles (JSON)
+  hyprshell-pkg run install|remove apt|flatpak ID   ejecuta (lo lanza la shell en una terminal)
+"""
+import gzip, json, os, re, shutil, subprocess, sys, time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+CACHE = Path.home() / ".cache/hyprshell/pkg"
+CACHE.mkdir(parents=True, exist_ok=True)
+
+
+def sh(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+
+# ---------------- APT ----------------
+def apt_installed():
+    out = sh(["dpkg-query", "-W", "-f=${db:Status-Abbrev}\t${Package}\n"])
+    return {l.split("\t")[1] for l in out.splitlines() if l.startswith("ii")}
+
+
+def apt_list():
+    inst = apt_installed()
+    rows = []
+    for line in sh(["apt-cache", "search", "."]).splitlines():
+        name, _, desc = line.partition(" - ")
+        if name:
+            rows.append(f"{name}\t{desc}\t{1 if name in inst else 0}")
+    return rows
+
+
+def apt_info(name):
+    out = sh(["apt-cache", "show", "--no-all-versions", name])
+    info, desc, in_desc = {}, [], False
+    for line in out.splitlines():
+        if in_desc:
+            if line.startswith(" "):
+                t = line[1:]
+                desc.append("" if t.strip() == "." else t)
+                continue
+            in_desc = False
+        k, _, v = line.partition(": ")
+        if k == "Description":
+            desc.append(v); in_desc = True
+        elif k in ("Version", "Installed-Size", "Homepage", "Section", "Maintainer", "Depends"):
+            info[k] = v
+    size = int(info.get("Installed-Size", "0") or 0)
+    return {
+        "id": name, "name": name,
+        "version": info.get("Version", ""),
+        "size": f"{size / 1024:.1f} MB" if size >= 1024 else f"{size} KB",
+        "homepage": info.get("Homepage", ""),
+        "section": info.get("Section", ""),
+        "summary": desc[0] if desc else "",
+        "description": "\n".join(desc[1:]).strip(),
+        "installed": name in apt_installed(),
+        "source": "apt",
+    }
+
+
+# ---------------- Flatpak (catalogo appstream de Flathub) ----------------
+def appstream_file():
+    cands = list((Path.home() / ".local/share/flatpak/appstream/flathub/x86_64").glob("*/appstream.xml.gz"))
+    cands += list(Path("/var/lib/flatpak/appstream/flathub/x86_64").glob("*/appstream.xml.gz"))
+    return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
+
+
+def flatpak_catalog():
+    """Lee appstream.xml.gz una vez y lo cachea en JSON (se rehace si el catalogo cambia)."""
+    src = appstream_file()
+    cache = CACHE / "flathub.json"
+    if src and cache.exists() and cache.stat().st_mtime >= src.stat().st_mtime:
+        return json.loads(cache.read_text())
+    if not src:
+        return {}
+    cat = {}
+    with gzip.open(src) as f:
+        for _, el in ET.iterparse(f):
+            if el.tag != "component":
+                continue
+            if el.get("type") not in ("desktop", "desktop-application", "console-application"):
+                el.clear(); continue
+            cid = (el.findtext("bundle") or "").split("/")[1] if el.find("bundle") is not None else el.findtext("id")
+            if not cid:
+                el.clear(); continue
+            def txt(tag):
+                for c in el.findall(tag):
+                    if c.get("{http://www.w3.org/XML/1998/namespace}lang") is None:
+                        return " ".join("".join(c.itertext()).split())
+                return ""
+            desc_el = next((d for d in el.findall("description") if d.get("{http://www.w3.org/XML/1998/namespace}lang") is None), None)
+            desc = ""
+            if desc_el is not None:
+                parts = []
+                for p in desc_el:
+                    t = " ".join("".join(p.itertext()).split())
+                    if p.tag == "ul":
+                        t = "\n".join("• " + " ".join("".join(li.itertext()).split()) for li in p)
+                    if t: parts.append(t)
+                desc = "\n\n".join(parts)
+            rel = el.find("releases/release")
+            icon = ""
+            for ic in el.findall("icon"):
+                if ic.get("type") == "cached":
+                    icon = ic.text or ""
+            cat[cid] = {
+                "id": cid, "name": txt("name") or cid, "summary": txt("summary"), "description": desc,
+                "version": rel.get("version", "") if rel is not None else "",
+                "homepage": next((u.text for u in el.findall("url") if u.get("type") == "homepage"), "") or "",
+                "developer": txt("developer_name") or txt("developer/name"),
+                "icon": icon,
+            }
+            el.clear()
+    # Rutas reales de los iconos (64x64 o 128x128) del catalogo
+    base = src.parent / "icons"
+    for c in cat.values():
+        for size in ("128x128", "64x64"):
+            p = base / size / c["icon"] if c["icon"] else None
+            if p and p.exists():
+                c["icon"] = str(p); break
+        else:
+            c["icon"] = ""
+    cache.write_text(json.dumps(cat))
+    return cat
+
+
+def flatpak_installed():
+    out = sh(["flatpak", "list", "--app", "--columns=application"])
+    return set(out.split())
+
+
+def flatpak_list():
+    cat, inst = flatpak_catalog(), flatpak_installed()
+    return [f"{c['name']}\t{c['summary']}\t{1 if i in inst else 0}\t{c['version']}\t{i}" for i, c in cat.items()]
+
+
+def flatpak_info(cid):
+    c = dict(flatpak_catalog().get(cid, {"id": cid, "name": cid}))
+    c["installed"] = cid in flatpak_installed()
+    c["source"] = "flatpak"
+    return c
+
+
+# ---------------- Fuentes ----------------
+def sources():
+    out = []
+    if shutil.which("apt-get"):
+        out.append({"id": "apt", "name": "APT", "subtitle": "Repositorios de Parrot",
+                    "detail": "Herramientas, librerias y el sistema", "sudo": True,
+                    "count": len(sh(["apt-cache", "pkgnames"]).split()), "installed": len(apt_installed())})
+    if shutil.which("flatpak") and appstream_file():
+        out.append({"id": "flatpak", "name": "Flatpak", "subtitle": "Flathub",
+                    "detail": "Apps de escritorio en su propio entorno", "sudo": False,
+                    "count": len(flatpak_catalog()), "installed": len(flatpak_installed())})
+    return out
+
+
+# ---------------- Ejecutar (en la terminal que abre la shell) ----------------
+def run(action, src, pid):
+    verbo = "Instalando" if action == "install" else "Desinstalando"
+    print(f"\033[1;36m{verbo}\033[0m {pid}  \033[90m({src})\033[0m\n")
+    if src == "apt":
+        cmd = ["sudo", "apt", "install" if action == "install" else "remove", pid]
+    else:
+        cmd = ["flatpak", "install" if action == "install" else "uninstall", "--user", "-y"] + (["flathub"] if action == "install" else []) + [pid]
+    code = subprocess.call(cmd)
+    ok = code == 0
+    hecho = "instalado" if action == "install" else "desinstalado"
+    subprocess.call(["notify-send", "-a", "Paquetes", "-i", "system-software-install",
+                     f"{pid} {hecho}" if ok else f"Fallo al {'instalar' if action == 'install' else 'desinstalar'} {pid}",
+                     f"Desde {src.upper()}" if ok else "Revisa la terminal para ver el error"])
+    if ok:
+        print(f"\n\033[1;32m✓ {pid} {hecho}.\033[0m Esta ventana se cierra sola.")
+        time.sleep(3)
+    else:
+        input(f"\n\033[1;31m✗ Termino con error ({code}).\033[0m Pulsa Enter para cerrar.")
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[:1] == ["sources"]:
+        print(json.dumps(sources()))
+    elif a[:1] == ["list"]:
+        print("\n".join(apt_list() if a[1] == "apt" else flatpak_list()))
+    elif a[:1] == ["info"]:
+        print(json.dumps(apt_info(a[2]) if a[1] == "apt" else flatpak_info(a[2])))
+    elif a[:1] == ["run"]:
+        run(a[1], a[2], a[3])
+    else:
+        print(__doc__)

@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""hyprshell-clip - historial del portapapeles para la shell (Super+V).
+
+Guarda en RAM ($XDG_RUNTIME_DIR/hyprshell-clip): nada toca el disco y se borra al reiniciar.
+  wl-paste --watch hyprshell-clip store   (lo arranca Hyprland) guarda cada copia
+  hyprshell-clip copy ID                  vuelve a poner un elemento en el portapapeles
+  hyprshell-clip delete ID | clear        borrar uno / todo
+"""
+import hashlib, json, os, re, subprocess, sys, time
+from pathlib import Path
+
+os.umask(0o077)  # solo el usuario puede leer el historial
+DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "hyprshell-clip"
+INDEX = DIR / "index.json"
+MAX = 100
+MAX_TEXT = 200_000
+
+
+def load():
+    try:
+        return json.loads(INDEX.read_text())
+    except Exception:
+        return []
+
+
+def save(items):
+    DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(DIR, 0o700)
+    tmp = INDEX.with_suffix(".tmp")
+    tmp.write_text(json.dumps(items))
+    tmp.replace(INDEX)
+
+
+def kind(text):
+    t = text.strip()
+    if re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}(:\d+)?(/\d{1,2})?", t): return "IP"
+    if re.fullmatch(r"[0-9a-fA-F:]{2,39}(/\d{1,3})?", t) and t.count(":") >= 2: return "IPv6"
+    if re.match(r"^(https?|ftp|ssh|smb)://\S+$", t): return "URL"
+    if re.fullmatch(r"[0-9a-fA-F]{32}", t): return "MD5"
+    if re.fullmatch(r"[0-9a-fA-F]{40}", t): return "SHA1"
+    if re.fullmatch(r"[0-9a-fA-F]{64}", t): return "SHA256"
+    if re.fullmatch(r"\$[0-9a-z]+\$\S+", t): return "hash"
+    if re.fullmatch(r"(~|/)[\w.\-/ ]*", t) and "/" in t: return "ruta"
+    if re.fullmatch(r"[\w.+-]+@[\w-]+\.[\w.-]+", t): return "correo"
+    if re.fullmatch(r"eyJ[\w-]+\.[\w-]+\.[\w-]*", t): return "JWT"
+    if len(t) >= 16 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", t) and len(t) % 4 == 0: return "base64"
+    if "\n" in t: return f"{t.count(chr(10)) + 1} lineas"
+    return ""
+
+
+def store():
+    state = os.environ.get("CLIPBOARD_STATE", "data")
+    if state in ("sensitive", "clear", "nil"):
+        sys.stdin.read(); return
+    types = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True).stdout.split()
+    if any("password" in t.lower() or t == "x-kde-passwordManagerHint" for t in types):
+        sys.stdin.read(); return
+    items = load()
+    now = time.time()
+    img = next((t for t in ("image/png", "image/jpeg", "image/webp") if t in types), None)
+    if img:
+        sys.stdin.buffer.read()
+        data = subprocess.run(["wl-paste", "--type", img], capture_output=True).stdout
+        if not data: return
+        h = hashlib.sha1(data).hexdigest()[:16]
+        f = DIR / f"{h}.{img.split('/')[1]}"
+        DIR.mkdir(parents=True, exist_ok=True)
+        if not f.exists(): f.write_bytes(data)
+        items = [i for i in items if i.get("id") != h]
+        items.insert(0, {"id": h, "type": "image", "mime": img, "file": str(f), "size": len(data), "time": now})
+    else:
+        text = sys.stdin.buffer.read().decode("utf-8", "replace")
+        if not text.strip() or len(text) > MAX_TEXT: return
+        h = hashlib.sha1(text.encode()).hexdigest()[:16]
+        items = [i for i in items if i.get("id") != h]
+        items.insert(0, {"id": h, "type": "text", "text": text, "kind": kind(text), "time": now})
+    # Recorta y borra imagenes que ya no estan en el historial
+    keep = items[:MAX]
+    for old in items[MAX:]:
+        if old.get("type") == "image" and not any(k.get("file") == old["file"] for k in keep):
+            Path(old["file"]).unlink(missing_ok=True)
+    save(keep)
+
+
+def copy(cid):
+    it = next((i for i in load() if i["id"] == cid), None)
+    if not it: return
+    if it["type"] == "image":
+        with open(it["file"], "rb") as f:
+            subprocess.run(["wl-copy", "--type", it["mime"]], stdin=f)
+    else:
+        subprocess.run(["wl-copy"], input=it["text"].encode())
+
+
+def delete(cid):
+    items = load()
+    for i in items:
+        if i["id"] == cid and i["type"] == "image":
+            Path(i["file"]).unlink(missing_ok=True)
+    save([i for i in items if i["id"] != cid])
+
+
+def clear():
+    for f in DIR.glob("*"):
+        if f.name != "index.json": f.unlink(missing_ok=True)
+    save([])
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    {"store": lambda: store(), "copy": lambda: copy(a[1]), "delete": lambda: delete(a[1]), "clear": lambda: clear()}.get(
+        a[0] if a else "", lambda: print(__doc__))()

@@ -1,0 +1,9 @@
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=0
+GRUB_DISTRIBUTOR='Parrot'
+GRUB_CMDLINE_LINUX_DEFAULT='quiet cryptdevice=UUID=4ec7f916-e59d-4e2c-a3e4-99f9eb60a07b:luks-4ec7f916-e59d-4e2c-a3e4-99f9eb60a07b root=/dev/mapper/luks-4ec7f916-e59d-4e2c-a3e4-99f9eb60a07b splash'
+GRUB_CMDLINE_LINUX=""
+GRUB_DISABLE_OS_PROBER=false
+GRUB_ENABLE_CRYPTODISK=y
+GRUB_TIMEOUT_STYLE=hidden
+GRUB_BACKGROUND="/boot/grub/hyprshell-loading.png"

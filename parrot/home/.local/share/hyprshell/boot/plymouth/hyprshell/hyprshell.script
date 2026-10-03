@@ -1,0 +1,100 @@
+# hyprshell - pantalla de carga de Plymouth
+# El primer fotograma es identico al fondo de GRUB (mismo color, mismo loro, misma posicion),
+# asi el paso GRUB -> Plymouth no se nota. Despues: brillo que respira y linea de progreso.
+
+Window.SetBackgroundTopColor(0.0275, 0.0431, 0.0510);
+Window.SetBackgroundBottomColor(0.0275, 0.0431, 0.0510);
+
+W = Window.GetWidth();
+H = Window.GetHeight();
+X0 = Window.GetX();
+Y0 = Window.GetY();
+CX = X0 + W / 2;
+CY = Y0 + H / 2 - 30;          # centro del loro (igual que en GRUB)
+
+# ---- Loro y brillo ----
+logo_img = Image("parrot.png");
+logo = Sprite(logo_img);
+logo.SetX(CX - logo_img.GetWidth() / 2);
+logo.SetY(CY - logo_img.GetHeight() / 2);
+logo.SetZ(10);
+
+glow_img = Image("glow.png");
+glow = Sprite(glow_img);
+glow.SetX(CX - glow_img.GetWidth() / 2);
+glow.SetY(CY - glow_img.GetHeight() / 2);
+glow.SetZ(5);
+glow.SetOpacity(0);
+
+# ---- Linea de progreso ----
+LINE_W = 200;
+LINE_Y = CY + logo_img.GetHeight() / 2 + 54;
+track = Sprite(Image("track.png").Scale(LINE_W, 2));
+track.SetX(CX - LINE_W / 2);
+track.SetY(LINE_Y);
+track.SetOpacity(0);
+fill = Sprite();
+fill.SetY(LINE_Y);
+fill.SetZ(2);
+
+t = 0;
+progress = 0;
+shown = 0;
+
+fun refresh_cb () {
+    global.t++;
+    # Aparicion suave de la linea tras el primer instante (el loro ya estaba en GRUB)
+    if (global.t > 10 && global.shown < 1) {
+        global.shown = global.shown + 0.05;
+        if (global.shown > 1) global.shown = 1;
+        track.SetOpacity(0.6 * global.shown);
+    }
+    # Brillo que respira
+    glow.SetOpacity(global.shown * (0.35 + 0.3 * Math.Sin(global.t / 18)));
+
+    w = Math.Int(LINE_W * global.progress);
+    if (w < 2) w = 2;
+    fill.SetImage(Image("fill.png").Scale(w, 2));
+    fill.SetX(CX - LINE_W / 2);
+    fill.SetOpacity(global.shown);
+}
+Plymouth.SetRefreshFunction(refresh_cb);
+
+fun progress_cb (duration, p) {
+    if (p > global.progress) global.progress = p;
+}
+Plymouth.SetBootProgressFunction(progress_cb);
+
+# ---- Contrasena (solo si alguna vez se pidiera aqui): una barra por caracter ----
+global.bars = [];
+global.nbars = 0;
+fun clear_bars () {
+    for (i = 0; i < global.nbars; i++) global.bars[i].SetOpacity(0);
+}
+fun password_cb (prompt, bullets) {
+    clear_bars();
+    bar_img = Image("bar.png");
+    step = 14;
+    start = CX - ((bullets - 1) * step) / 2 - 2;
+    for (i = 0; i < bullets; i++) {
+        if (!global.bars[i]) global.bars[i] = Sprite(bar_img);
+        global.bars[i].SetImage(bar_img);
+        global.bars[i].SetX(start + i * step);
+        global.bars[i].SetY(LINE_Y + 40);
+        global.bars[i].SetOpacity(1);
+    }
+    if (bullets > global.nbars) global.nbars = bullets;
+}
+Plymouth.SetDisplayPasswordFunction(password_cb);
+
+fun normal_cb () {
+    clear_bars();
+}
+Plymouth.SetDisplayNormalFunction(normal_cb);
+
+fun quit_cb () {
+    track.SetOpacity(0);
+    fill.SetOpacity(0);
+    glow.SetOpacity(0);
+}
+Plymouth.SetQuitFunction(quit_cb);

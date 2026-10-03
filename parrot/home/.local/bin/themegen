@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""themegen - genera una paleta sobria a partir del fondo de pantalla.
+
+Uso:
+    themegen <imagen>        genera la paleta y la aplica a todo el sistema
+    themegen --preview <img> solo muestra la paleta en la terminal
+    themegen --thumbs [dir]  genera miniaturas para el selector de fondos
+
+Fidelidad: agrupa los pixeles del fondo (k-means en OKLab) y usa sus colores
+reales. El acento conserva el tono y el croma del fondo; solo se ajusta la
+luminosidad para que se lea sobre las superficies oscuras. No se inventan tonos:
+si el fondo tiene un solo color, el secundario es ese tono con otra luz, y si es
+gris la paleta es neutra.
+"""
+import colorsys
+import json
+import math
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+CACHE = Path.home() / ".cache" / "hyprshell"
+
+
+# ----------------------------------------------------------------------------
+# Conversion de color sRGB <-> OKLab <-> OKLCH
+# ----------------------------------------------------------------------------
+def _lin(c):
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def _gamma(c):
+    return np.where(c <= 0.0031308, 12.92 * c, 1.055 * np.power(np.clip(c, 0, None), 1 / 2.4) - 0.055)
+
+
+def srgb_to_oklch(rgb):
+    """rgb: array (N,3) en 0..1 -> array (N,3) con L, C, h(grados)."""
+    r, g, b = _lin(rgb).T
+    l = np.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+    m = np.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+    s = np.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+    L = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s
+    A = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s
+    B = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s
+    return np.stack([L, np.hypot(A, B), np.degrees(np.arctan2(B, A)) % 360], axis=1)
+
+
+def oklch_to_hex(L, C, h):
+    """Convierte a hex reduciendo croma hasta que el color quepa en sRGB."""
+    for _ in range(40):
+        a, b = C * math.cos(math.radians(h)), C * math.sin(math.radians(h))
+        l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3
+        m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3
+        s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3
+        rgb = np.array([
+            4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+            -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+            -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+        ])
+        if rgb.min() >= -1e-4 and rgb.max() <= 1 + 1e-4:
+            break
+        C *= 0.92
+    out = np.clip(_gamma(np.clip(rgb, 0, 1)), 0, 1)
+    return "#" + "".join(f"{round(v * 255):02x}" for v in out)
+
+
+# ----------------------------------------------------------------------------
+# Analisis del fondo de pantalla
+# ----------------------------------------------------------------------------
+def oklab_to_lch(lab):
+    L, A, B = lab.T
+    return np.stack([L, np.hypot(A, B), np.degrees(np.arctan2(B, A)) % 360], axis=1)
+
+
+def srgb_to_oklab(rgb):
+    r, g, b = _lin(rgb).T
+    l = np.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+    m = np.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+    s = np.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+    return np.stack([
+        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    ], axis=1)
+
+
+def kmeans(x, k=10, iters=30):
+    """k-means determinista (inicio k-means++ con semilla fija)."""
+    rng = np.random.default_rng(0)
+    centers = [x[rng.integers(len(x))]]
+    for _ in range(k - 1):
+        d = np.min(((x[:, None] - np.array(centers)[None]) ** 2).sum(-1), axis=1)
+        if d.sum() == 0:
+            break
+        centers.append(x[rng.choice(len(x), p=d / d.sum())])
+    c = np.array(centers)
+    for _ in range(iters):
+        lbl = np.argmin(((x[:, None] - c[None]) ** 2).sum(-1), axis=1)
+        new = np.array([x[lbl == i].mean(0) if (lbl == i).any() else c[i] for i in range(len(c))])
+        if np.allclose(new, c, atol=1e-5):
+            break
+        c = new
+    share = np.bincount(lbl, minlength=len(c)) / len(x)
+    return c, share
+
+
+def hue_dist(a, b):
+    d = abs(a - b) % 360
+    return min(d, 360 - d)
+
+
+def analyze(path):
+    """Devuelve los colores REALES del fondo: grupos (L, C, h, proporcion)."""
+    img = Image.open(path).convert("RGB")
+    img.thumbnail((200, 200))
+    px = np.asarray(img, dtype=np.float64).reshape(-1, 3) / 255.0
+    lab = srgb_to_oklab(px)
+    # Distancia en OKLab con el croma algo mas pesado: separa colores, no solo luces
+    w = np.array([1.0, 1.6, 1.6])
+    centers, share = kmeans(lab * w, k=10)
+    centers = centers / w
+    lch = oklab_to_lch(centers)
+    clusters = [dict(L=float(L), C=float(C), h=float(h), share=float(s))
+                for (L, C, h), s in zip(lch, share) if s > 0]
+    return clusters
+
+
+def pick(clusters):
+    """Elige fondo, acento y acento secundario entre los colores reales."""
+    # Tinte de las superficies: el color que mas area ocupa (normalmente el oscuro de fondo)
+    base = max(clusters, key=lambda c: c["share"])
+    chromatic = [c for c in clusters if c["C"] > 0.03 and c["share"] > 0.01]
+
+    # Acento: color con presencia real y con color. Pesa el area, no solo la saturacion,
+    # para que una mancha pequena y chillona no domine el esquema.
+    # Los tonos casi negros apenas se perciben como color: pesan menos.
+    def score(c):
+        vis = min(max(c["L"] / 0.6, 0.2), 1.0) ** 1.5
+        return (c["share"] ** 0.5) * (c["C"] ** 1.3) * vis
+
+    if not chromatic:
+        # Fondo realmente gris: paleta neutra con el leve tono que tenga (sin inventar)
+        hue = base["h"]
+        return base, dict(L=0.78, C=min(base["C"], 0.02), h=hue), dict(L=0.66, C=min(base["C"], 0.02), h=hue)
+
+    ranked = sorted(chromatic, key=score, reverse=True)
+    acc = ranked[0]
+    acc2 = next((c for c in ranked[1:] if hue_dist(c["h"], acc["h"]) >= 25
+                 and score(c) > 0.2 * score(acc)), None)
+    if acc2 is None:
+        # Un solo tono en el fondo: el secundario es el mismo tono, otra luminosidad
+        acc2 = dict(acc, L=acc["L"] + 0.12 if acc["L"] < 0.7 else acc["L"] - 0.12, C=acc["C"] * 0.75)
+    return base, acc, acc2
+
+
+def readable(c, lo, hi, cmax):
+    """Mantiene tono y croma reales; solo mueve la luz al rango legible sobre fondo oscuro."""
+    return min(max(c["L"], lo), hi), min(c["C"], cmax), c["h"]
+
+
+def build_palette(clusters):
+    base, acc, acc2 = pick(clusters)
+    bh = base["h"]
+    # Tinte proporcional al color real del fondo: un fondo gris da superficies grises
+    tint = min(base["C"] * 0.35, 0.018)
+    primary = acc["h"]
+
+    def mix(h, toward, t=0.10):
+        d = ((toward - h + 180) % 360) - 180
+        return (h + d * t) % 360
+
+    aL, aC, aH = readable(acc, 0.70, 0.84, 0.16)
+    bL, bC, bH = readable(acc2, 0.70, 0.86, 0.14)
+    p = {
+        # superficies
+        "bg":        oklch_to_hex(0.145, tint, bh),
+        "surface":   oklch_to_hex(0.180, tint * 1.1, bh),
+        "surface2":  oklch_to_hex(0.215, tint * 1.2, bh),
+        "overlay":   oklch_to_hex(0.300, tint * 1.5, bh),
+        # texto
+        "fg":        oklch_to_hex(0.900, min(tint, 0.010), bh),
+        "fgMuted":   oklch_to_hex(0.680, min(tint * 1.2, 0.014), bh),
+        "fgDim":     oklch_to_hex(0.500, min(tint * 1.2, 0.014), bh),
+        # acentos (colores reales del fondo)
+        "accent":    oklch_to_hex(aL, aC, aH),
+        "accentDim": oklch_to_hex(aL - 0.18, aC * 0.8, aH),
+        "accent2":   oklch_to_hex(bL, bC, bH),
+        # semanticos (fijos para conservar su significado, apenas armonizados)
+        "red":       oklch_to_hex(0.680, 0.130, mix(25, primary)),
+        "yellow":    oklch_to_hex(0.820, 0.100, mix(85, primary)),
+        "green":     oklch_to_hex(0.770, 0.110, mix(150, primary)),
+        "blue":      oklch_to_hex(0.730, 0.100, mix(245, primary)),
+        "magenta":   oklch_to_hex(0.720, 0.110, mix(330, primary)),
+        "cyan":      oklch_to_hex(0.780, 0.090, mix(200, primary)),
+    }
+    p["meta"] = {"accent": [round(acc["L"], 3), round(acc["C"], 3), round(acc["h"], 1), round(acc["share"], 3) if "share" in acc else None],
+                 "base": [round(base["L"], 3), round(base["C"], 3), round(bh, 1), round(base["share"], 3)]}
+    return p
+
+
+# ----------------------------------------------------------------------------
+# Salidas para cada programa
+# ----------------------------------------------------------------------------
+def h(c):
+    return c.lstrip("#")
+
+
+def write_outputs(p, wallpaper):
+    CACHE.mkdir(parents=True, exist_ok=True)
+    data = dict(p, wallpaper=str(wallpaper))
+    (CACHE / "colors.json").write_text(json.dumps(data, indent=2))
+
+    (CACHE / "hyprland-colors.conf").write_text(f"""# Generado por themegen - no editar
+general {{
+    col.active_border = rgba({h(p['accent'])}ee) rgba({h(p['accent2'])}ee) 45deg
+    col.inactive_border = rgba({h(p['overlay'])}aa)
+}}
+decoration {{
+    shadow {{
+        color = rgba({h(p['bg'])}ee)
+    }}
+}}
+misc {{
+    # Color que se ve antes de que la shell dibuje el fondo (al iniciar sesion)
+    background_color = rgb({h(p['bg'])})
+}}
+""")
+
+    (CACHE / "kitty-colors.conf").write_text(f"""# Generado por themegen - no editar
+foreground {p['fg']}
+background {p['bg']}
+selection_foreground {p['bg']}
+selection_background {p['accent']}
+cursor {p['accent']}
+cursor_text_color {p['bg']}
+url_color {p['accent2']}
+active_border_color {p['accent']}
+inactive_border_color {p['overlay']}
+active_tab_foreground {p['bg']}
+active_tab_background {p['accent']}
+inactive_tab_foreground {p['fgMuted']}
+inactive_tab_background {p['surface']}
+tab_bar_background {p['bg']}
+color0  {p['surface2']}
+color8  {p['fgDim']}
+color1  {p['red']}
+color9  {p['red']}
+color2  {p['green']}
+color10 {p['green']}
+color3  {p['yellow']}
+color11 {p['yellow']}
+color4  {p['blue']}
+color12 {p['blue']}
+color5  {p['magenta']}
+color13 {p['magenta']}
+color6  {p['accent']}
+color14 {p['accent2']}
+color7  {p['fgMuted']}
+color15 {p['fg']}
+""")
+
+
+# Mascara del loro con alas (extraida de emblem-parrot.svg de Parrot, ver ~/.local/share/hyprshell/)
+LOGO_CELLS = (33, 15)   # columnas x filas en fastfetch
+CELL_PX = (9, 21)       # celda de kitty (JetBrainsMono 11.5)
+PARROT_MASK = Path.home() / ".local" / "share" / "hyprshell" / "parrot-wings-mask.png"
+
+
+def write_logo(p):
+    """Loro de Parrot con las alas abiertas, con degradado acento -> acento 2.
+    La usa fastfetch como imagen en kitty."""
+    if not PARROT_MASK.is_file():
+        return
+    m = Image.open(PARROT_MASK).convert("RGBA").split()[3]
+    box = m.getbbox()
+    if not box:
+        return
+    m = m.crop(box)
+    w, h = m.size
+    c1 = np.array([int(p["accent"][i:i + 2], 16) for i in (1, 3, 5)], dtype=np.float64)
+    c2 = np.array([int(p["accent2"][i:i + 2], 16) for i in (1, 3, 5)], dtype=np.float64)
+    # Degradado diagonal (de la cabeza a la cola)
+    yy, xx = np.mgrid[0:h, 0:w]
+    t = ((xx / max(w - 1, 1)) * 0.35 + (yy / max(h - 1, 1)) * 0.65)[..., None]
+    grad = c1 * (1 - t) + c2 * t
+    out = np.dstack([grad, np.asarray(m, dtype=np.float64)]).astype(np.uint8)
+    # Tamano exacto de la caja que ocupa en kitty (33x15 celdas de 9x21 px) para que
+    # kitty no tenga que escalarla: asi se ve nitida. Se reduce desde la mascara grande.
+    box_w, box_h = LOGO_CELLS[0] * CELL_PX[0], LOGO_CELLS[1] * CELL_PX[1]
+    logo = Image.fromarray(out, "RGBA")
+    scale = min((box_w * 0.96) / w, (box_h * 0.96) / h)
+    logo = logo.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
+    img = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
+    img.paste(logo, ((box_w - logo.width) // 2, (box_h - logo.height) // 2))
+    img.save(CACHE / "parrot.png")
+
+
+def reload_apps():
+    cmds = [
+        ["hyprctl", "reload"],
+        ["pkill", "-USR1", "-x", "kitty"],  # kitty relee su configuracion
+    ]
+    for c in cmds:
+        subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def preview(p):
+    for k, v in p.items():
+        if k == "meta":
+            continue
+        r, g, b = (int(v[i:i + 2], 16) for i in (1, 3, 5))
+        print(f"\033[48;2;{r};{g};{b}m      \033[0m {k:<10} {v}")
+    print(p["meta"])
+
+
+def make_thumbs(directory):
+    """Miniaturas 480x270 en ~/.cache/hyprshell/thumbs (solo las que falten o esten viejas)."""
+    out = CACHE / "thumbs"
+    out.mkdir(parents=True, exist_ok=True)
+    for src in sorted(Path(directory).expanduser().iterdir()):
+        if src.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
+            continue
+        dst = out / (src.name + ".jpg")
+        if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+            continue
+        img = Image.open(src).convert("RGB")
+        img.thumbnail((960, 960))
+        w, h = img.size
+        tw, th = (w, round(w * 9 / 16)) if w / h < 16 / 9 else (round(h * 16 / 9), h)
+        left, top = (w - tw) // 2, (h - th) // 2
+        img.crop((left, top, left + tw, top + th)).resize((480, 270), Image.LANCZOS).save(dst, quality=88)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        sys.exit(1)
+    if args[0] == "--thumbs":
+        make_thumbs(args[1] if len(args) > 1 else "~/Pictures/Wallpapers")
+        return
+    only_preview = args[0] == "--preview"
+    img = Path(args[-1]).expanduser().resolve()
+    if not img.is_file():
+        sys.exit(f"themegen: no existe {img}")
+
+    palette = build_palette(analyze(img))
+    if only_preview:
+        preview(palette)
+        return
+    write_outputs(palette, img)
+    write_logo(palette)
+    # Temas de las apps (GTK, Qt, iconos) en segundo plano: el cambio de fondo sigue siendo instantaneo
+    subprocess.Popen([str(Path.home() / ".local/bin/themegen-apps")], stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    reload_apps()
+    print(f"themegen: paleta aplicada desde {img.name}")
+
+
+if __name__ == "__main__":
+    main()
